@@ -1,4 +1,6 @@
 fastapi
 uvicorn
 numpy
-pydantic
+pandas
+openpyxl
+python-multipart

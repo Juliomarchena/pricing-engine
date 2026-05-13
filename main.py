@@ -1,36 +1,45 @@
 """
 =============================================================
-PRICING ANALYTICS ENGINE — API REST
+PRICING ANALYTICS ENGINE — API REST (v2.0 con Upload Excel)
 =============================================================
 Curso: Marketing Analytics: Precios y Promociones
 CENTRUM PUCP — Prof. Julio Marchena Ramírez
 
 Endpoints:
-  GET  /               → Todos los datos de pricing (como ACME)
+  GET  /               → Todos los datos de pricing
   GET  /productos      → Lista de productos con elasticidades
   POST /simular        → Simular cambio de precio
   POST /precio-optimo  → Calcular precio óptimo
   POST /montecarlo     → Simulación Monte Carlo
   POST /comparar       → Comparar múltiples escenarios
+  POST /upload         → Subir Excel con datos propios (solo Swagger)
   GET  /docs           → Swagger UI automático
 
-Deploy: Render o Railway
+Deploy: Render
   Build: pip install -r requirements.txt
   Start: uvicorn main:app --host 0.0.0.0 --port $PORT
 =============================================================
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import numpy as np
-import json
+import pandas as pd
+import io
 
 app = FastAPI(
     title="Pricing Analytics Engine",
-    description="Motor de análisis de pricing con elasticidad, simulación de escenarios y Monte Carlo. CENTRUM PUCP.",
-    version="1.0.0",
+    description=(
+        "Motor de análisis de pricing con elasticidad, simulación de escenarios y Monte Carlo.\n\n"
+        "**¿Cómo cargar tus propios datos?**\n"
+        "1. Usa el endpoint /upload para subir tu Excel\n"
+        "2. El Excel debe tener las columnas: producto, precio_actual, cantidad_mensual, elasticidad, costo_variable_pct, r2\n"
+        "3. Una vez cargado, todos los endpoints trabajarán con TUS datos\n\n"
+        "CENTRUM PUCP — Prof. Julio Marchena Ramírez"
+    ),
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -41,7 +50,7 @@ app.add_middleware(
 )
 
 # ===========================================================
-# BASE DE DATOS DE PRODUCTOS (pre-calculado con regresión)
+# BASE DE DATOS DE PRODUCTOS (default, se reemplaza con upload)
 # ===========================================================
 PRODUCTOS = {
     "Cafe Premium": {
@@ -86,6 +95,8 @@ PRODUCTOS = {
     },
 }
 
+EMPRESA_NOMBRE = "Cafeteria Premium SAC"
+
 
 # ===========================================================
 # MODELOS PYDANTIC
@@ -112,8 +123,19 @@ class CompararRequest(BaseModel):
 # ===========================================================
 # FUNCIONES DE CÁLCULO
 # ===========================================================
+def clasificar_elasticidad(e):
+    abs_e = abs(e)
+    if abs_e < 1:
+        return "Inelastico"
+    elif abs_e < 1.5:
+        return "Elastico moderado"
+    elif abs_e < 2.5:
+        return "Elastico"
+    else:
+        return "Muy elastico"
+
+
 def calcular_simulacion(producto_nombre: str, cambio_pct: float):
-    """Calcula el impacto de un cambio de precio."""
     p = PRODUCTOS[producto_nombre]
     precio_actual = p["precio_actual"]
     cantidad_actual = p["cantidad_mensual"]
@@ -161,15 +183,124 @@ def calcular_simulacion(producto_nombre: str, cambio_pct: float):
 
 
 # ===========================================================
-# ENDPOINT PRINCIPAL (como el de ACME)
+# UPLOAD DE EXCEL (solo desde Swagger /docs)
 # ===========================================================
-@app.get("/")
+@app.post("/upload", summary="Subir Excel con datos propios", tags=["Cargar Datos"])
+async def upload_excel(
+    archivo: UploadFile = File(
+        ...,
+        description="Archivo Excel (.xlsx) con columnas: producto, precio_actual, cantidad_mensual, elasticidad, costo_variable_pct, r2"
+    )
+):
+    """
+    **Sube tu archivo Excel para trabajar con tus propios datos.**
+
+    El Excel debe tener una hoja con estas columnas exactas:
+
+    | producto | precio_actual | cantidad_mensual | elasticidad | costo_variable_pct | r2 |
+    |----------|--------------|-----------------|-------------|-------------------|-----|
+    | Aspirina 500mg | 12.50 | 3200 | -0.3 | 0.25 | 0.91 |
+    | Vitamina C | 8.90 | 1500 | -1.8 | 0.30 | 0.85 |
+
+    **Notas:**
+    - elasticidad: siempre negativa (ej: -1.4)
+    - costo_variable_pct: entre 0 y 1 (ej: 0.45 = 45%)
+    - r2: entre 0 y 1 (ej: 0.87)
+    - Una vez cargado, todos los endpoints usan tus datos
+    - Para volver a los datos originales, reinicia la API
+    """
+    global PRODUCTOS, EMPRESA_NOMBRE
+
+    if not archivo.filename.endswith(('.xlsx', '.xls')):
+        return {
+            "error": "El archivo debe ser .xlsx o .xls",
+            "ayuda": "Descarga la plantilla de ejemplo y úsala como base."
+        }
+
+    try:
+        contenido = await archivo.read()
+        df = pd.read_excel(io.BytesIO(contenido))
+
+        columnas_requeridas = ['producto', 'precio_actual', 'cantidad_mensual', 'elasticidad', 'costo_variable_pct', 'r2']
+        columnas_archivo = [c.strip().lower() for c in df.columns]
+        df.columns = columnas_archivo
+
+        faltantes = [c for c in columnas_requeridas if c not in columnas_archivo]
+        if faltantes:
+            return {
+                "error": f"Faltan columnas: {faltantes}",
+                "columnas_encontradas": list(df.columns),
+                "columnas_requeridas": columnas_requeridas,
+                "ayuda": "Verifica que tu Excel tenga exactamente estas columnas: producto, precio_actual, cantidad_mensual, elasticidad, costo_variable_pct, r2"
+            }
+
+        if len(df) == 0:
+            return {"error": "El Excel está vacío. Debe tener al menos 1 producto."}
+
+        # Validar datos numéricos
+        errores = []
+        for i, row in df.iterrows():
+            fila = i + 2  # fila real en Excel (header = 1)
+            if pd.isna(row['producto']) or str(row['producto']).strip() == '':
+                errores.append(f"Fila {fila}: producto vacío")
+            if not isinstance(row['precio_actual'], (int, float)) or row['precio_actual'] <= 0:
+                errores.append(f"Fila {fila}: precio_actual debe ser positivo")
+            if not isinstance(row['cantidad_mensual'], (int, float)) or row['cantidad_mensual'] <= 0:
+                errores.append(f"Fila {fila}: cantidad_mensual debe ser positiva")
+            if not isinstance(row['elasticidad'], (int, float)) or row['elasticidad'] >= 0:
+                errores.append(f"Fila {fila}: elasticidad debe ser negativa (ej: -1.4)")
+            if not isinstance(row['costo_variable_pct'], (int, float)) or not (0 < row['costo_variable_pct'] < 1):
+                errores.append(f"Fila {fila}: costo_variable_pct debe estar entre 0 y 1 (ej: 0.45)")
+            if not isinstance(row['r2'], (int, float)) or not (0 < row['r2'] <= 1):
+                errores.append(f"Fila {fila}: r2 debe estar entre 0 y 1")
+
+        if errores:
+            return {
+                "error": "Errores de validación en los datos",
+                "detalle": errores,
+                "ayuda": "Corrige los errores y vuelve a subir el archivo."
+            }
+
+        # Cargar datos
+        nuevos_productos = {}
+        for _, row in df.iterrows():
+            nombre = str(row['producto']).strip()
+            nuevos_productos[nombre] = {
+                "precio_actual": round(float(row['precio_actual']), 2),
+                "cantidad_mensual": int(row['cantidad_mensual']),
+                "elasticidad": round(float(row['elasticidad']), 2),
+                "costo_variable_pct": round(float(row['costo_variable_pct']), 2),
+                "tipo": clasificar_elasticidad(float(row['elasticidad'])),
+                "r2": round(float(row['r2']), 2)
+            }
+
+        PRODUCTOS = nuevos_productos
+        EMPRESA_NOMBRE = archivo.filename.replace('.xlsx', '').replace('.xls', '').replace('_', ' ').title()
+
+        return {
+            "mensaje": f"Datos cargados exitosamente: {len(PRODUCTOS)} productos",
+            "empresa": EMPRESA_NOMBRE,
+            "productos_cargados": list(PRODUCTOS.keys()),
+            "detalle": {nombre: {"precio": p["precio_actual"], "elasticidad": p["elasticidad"], "tipo": p["tipo"]} for nombre, p in PRODUCTOS.items()},
+            "siguiente_paso": "Ahora ve a Copilot Studio y pregúntale al agente sobre tus productos. Ejemplo: '¿Cuál es el precio óptimo de [tu producto]?'"
+        }
+
+    except Exception as e:
+        return {
+            "error": f"No se pudo leer el archivo: {str(e)}",
+            "ayuda": "Asegúrate de que el archivo sea un Excel válido (.xlsx) con las columnas correctas."
+        }
+
+
+# ===========================================================
+# ENDPOINT PRINCIPAL
+# ===========================================================
+@app.get("/", summary="Obtener todos los datos", tags=["Consultas"])
 def obtener_todos_los_datos():
     """
     Devuelve TODOS los datos de pricing en tiempo real:
     productos con elasticidades, precios actuales, cantidades,
     precio optimo calculado y tipo de elasticidad.
-    Equivalente a 'Obtener todos los datos de ACME'.
     """
     productos_con_optimo = []
     for nombre, p in PRODUCTOS.items():
@@ -206,11 +337,11 @@ def obtener_todos_los_datos():
         })
 
     resumen = {
-        "empresa": "Cafeteria Premium SAC",
+        "empresa": EMPRESA_NOMBRE,
         "ubicacion": "Lima, Peru",
         "periodo_datos": "24 meses",
         "metodo": "Regresion log-log (ln precio vs ln cantidad)",
-        "costo_variable_pct": "45% del precio",
+        "costo_variable_pct": "Porcentaje del precio (varía por producto)",
         "total_productos": len(PRODUCTOS),
         "productos_elasticos": sum(1 for p in PRODUCTOS.values() if abs(p["elasticidad"]) > 1),
         "productos_inelasticos": sum(1 for p in PRODUCTOS.values() if abs(p["elasticidad"]) <= 1),
@@ -223,16 +354,23 @@ def obtener_todos_los_datos():
     }
 
 
-@app.get("/productos")
+@app.get("/productos", summary="Listar productos", tags=["Consultas"])
 def listar_productos():
-    """Lista todos los productos con sus elasticidades."""
-    return {"productos": list(PRODUCTOS.keys())}
+    """Lista todos los productos disponibles con sus elasticidades."""
+    return {
+        "empresa": EMPRESA_NOMBRE,
+        "total": len(PRODUCTOS),
+        "productos": [
+            {"nombre": k, "precio": v["precio_actual"], "elasticidad": v["elasticidad"], "tipo": v["tipo"]}
+            for k, v in PRODUCTOS.items()
+        ]
+    }
 
 
 # ===========================================================
 # SIMULADOR DE ESCENARIOS
 # ===========================================================
-@app.post("/simular")
+@app.post("/simular", summary="Simular cambio de precio", tags=["Análisis"])
 def simular_cambio_precio(req: SimularRequest):
     """
     Simula que pasa si cambias el precio de un producto X%.
@@ -240,21 +378,20 @@ def simular_cambio_precio(req: SimularRequest):
     """
     if req.producto not in PRODUCTOS:
         return {"error": f"Producto '{req.producto}' no encontrado. Productos disponibles: {list(PRODUCTOS.keys())}"}
-
     return calcular_simulacion(req.producto, req.cambio_precio_pct)
 
 
 # ===========================================================
 # PRECIO ÓPTIMO
 # ===========================================================
-@app.post("/precio-optimo")
+@app.post("/precio-optimo", summary="Calcular precio óptimo", tags=["Análisis"])
 def calcular_precio_optimo(req: PrecioOptimoRequest):
     """
     Calcula el precio optimo que maximiza la contribucion total.
     Formula: Margen optimo = -1/Elasticidad, Precio optimo = CV / (1 - Margen)
     """
     if req.producto not in PRODUCTOS:
-        return {"error": f"Producto '{req.producto}' no encontrado."}
+        return {"error": f"Producto '{req.producto}' no encontrado. Productos disponibles: {list(PRODUCTOS.keys())}"}
 
     p = PRODUCTOS[req.producto]
     e = p["elasticidad"]
@@ -289,14 +426,14 @@ def calcular_precio_optimo(req: PrecioOptimoRequest):
 # ===========================================================
 # SIMULACIÓN MONTE CARLO
 # ===========================================================
-@app.post("/montecarlo")
+@app.post("/montecarlo", summary="Simulación Monte Carlo", tags=["Análisis"])
 def simulacion_montecarlo(req: MonteCarloRequest):
     """
     Simula N escenarios con incertidumbre en elasticidad y costos.
     Responde: cual es la PROBABILIDAD de que el cambio de precio sea rentable?
     """
     if req.producto not in PRODUCTOS:
-        return {"error": f"Producto '{req.producto}' no encontrado."}
+        return {"error": f"Producto '{req.producto}' no encontrado. Productos disponibles: {list(PRODUCTOS.keys())}"}
 
     p = PRODUCTOS[req.producto]
     np.random.seed(42)
@@ -338,14 +475,14 @@ def simulacion_montecarlo(req: MonteCarloRequest):
 # ===========================================================
 # COMPARADOR DE ESCENARIOS
 # ===========================================================
-@app.post("/comparar")
+@app.post("/comparar", summary="Comparar escenarios de precio", tags=["Análisis"])
 def comparar_escenarios(req: CompararRequest):
     """
     Compara multiples cambios de precio para un producto.
     Ejemplo: escenarios=[-20, -10, 0, 10, 20]
     """
     if req.producto not in PRODUCTOS:
-        return {"error": f"Producto '{req.producto}' no encontrado."}
+        return {"error": f"Producto '{req.producto}' no encontrado. Productos disponibles: {list(PRODUCTOS.keys())}"}
 
     resultados = []
     for cambio in req.escenarios:
