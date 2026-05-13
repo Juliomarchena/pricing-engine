@@ -219,10 +219,28 @@ async def upload_excel(
 
     try:
         contenido = await archivo.read()
-        df = pd.read_excel(io.BytesIO(contenido))
-
         columnas_requeridas = ['producto', 'precio_actual', 'cantidad_mensual', 'elasticidad', 'costo_variable_pct', 'r2']
-        columnas_archivo = [c.strip().lower() for c in df.columns]
+
+        # Intentar encontrar la fila del header automáticamente
+        # Busca en las primeras 10 filas cuál tiene la columna "producto"
+        df = None
+        for header_row in range(0, 10):
+            try:
+                df_test = pd.read_excel(io.BytesIO(contenido), header=header_row)
+                cols_test = [str(c).strip().lower() for c in df_test.columns]
+                if 'producto' in cols_test:
+                    df = df_test
+                    break
+            except Exception:
+                continue
+
+        if df is None:
+            return {
+                "error": "No se encontró la fila de encabezados con la columna 'producto'",
+                "ayuda": "Asegúrate de que tu Excel tenga una fila con estos encabezados: producto, precio_actual, cantidad_mensual, elasticidad, costo_variable_pct, r2"
+            }
+
+        columnas_archivo = [str(c).strip().lower() for c in df.columns]
         df.columns = columnas_archivo
 
         faltantes = [c for c in columnas_requeridas if c not in columnas_archivo]
